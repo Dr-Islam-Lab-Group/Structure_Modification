@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>2D Tanimoto Similarity (RDKit Cloud)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; max-width: 980px; }
+    h1 { font-size: 20px; margin: 0 0 12px; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 16px; margin: 12px 0; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    label { font-weight: 600; }
+    input[type="file"] { padding: 6px; }
+    button { padding: 10px 14px; border-radius: 10px; border: 1px solid #ccc; background: #f7f7f7; cursor: pointer; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .muted { color: #666; font-size: 13px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; }
+    progress { width: 100%; height: 18px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { border-bottom: 1px solid #eee; padding: 8px; text-align: left; font-size: 13px; }
+    th { background: #fafafa; position: sticky; top: 0; }
+    .ok { color: #0a7; }
+    .err { color: #b00; }
+  </style>
+</head>
+<body>
+  <h1>2D Tanimoto Similarity (RDKit Cloud)</h1>
+  <div class="muted">
+    Upload a <b>tab-separated</b> text file with headers: <span class="mono">Name<TAB>SMILES</span>.
+    The site will call your Cloud Run API and generate a CSV with <span class="mono">2d_tanimoto_similarity</span>.
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <label for="file">Input file:</label>
+      <input id="file" type="file" accept=".txt,.tsv,.tab,text/plain" />
+      <button id="runBtn" disabled>Run similarity</button>
+      <button id="cancelBtn" disabled>Cancel</button>
+      <button id="downloadBtn" disabled>Download CSV</button>
+    </div>
+
+    <div style="margin-top:12px;">
+      <div class="row">
+        <div class="muted">API endpoint:</div>
+        <div class="mono" id="apiUrl"></div>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <div class="muted">Concurrency (faster but heavier):</div>
+        <select id="concurrency">
+          <option value="1">1</option>
+          <option value="3" selected>3</option>
+          <option value="5">5</option>
+          <option value="8">8</option>
+        </select>
+        <div class="muted">Retry on transient errors:</div>
+        <select id="retries">
+          <option value="0">0</option>
+          <option value="1" selected>1</option>
+          <option value="2">2</option>
+        </select>
+      </div>
+
+      <div style="margin-top:12px;">
+        <progress id="prog" value="0" max="100"></progress>
+        <div class="muted" id="status" style="margin-top:8px;">Waiting for file…</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <div class="muted">Preview (first 20 rows):</div>
+      <div class="muted">OK: <span class="ok">green</span>, Errors: <span class="err">red</span></div>
+    </div>
+    <div style="max-height: 420px; overflow: auto; margin-top: 10px;">
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Name</th>
+            <th>SMILES</th>
+            <th>2d_tanimoto_similarity</th>
+            <th>error</th>
+          </tr>
+        </thead>
+        <tbody id="previewBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+<script>
+(() => {
+  const API = "https://rdkit-api-703402153382.us-central1.run.app/tanimoto";
+  const SIM_COL = "2d_tanimoto_similarity";
+
+  const fileEl = document.getElementById("file");
+  const runBtn = document.getElementById("runBtn");
+  const cancelBtn = document.getElementById("cancelBtn");
+  const downloadBtn = document.getElementById("downloadBtn");
+  const prog = document.getElementById("prog");
+  const statusEl = document.getElementById("status");
+  const previewBody = document.getElementById("previewBody");
+  const apiUrlEl = document.getElementById("apiUrl");
+  const concurrencyEl = document.getElementById("concurrency");
+  const retriesEl = document.getElementById("retries");
+
+  apiUrlEl.textContent = API;
+
+  let abort = false;
+  let lastCsv = null;
+
+  function setStatus(msg) { statusEl.textContent = msg; }
+
+  function escapeCsv(value) {
+    const s = (value ?? "").toString();
+    if (/[",\n\r]/.test(s)) return `"${s.replaceAll('"','""')}"`;
+    return s;
+  }
+
+  function parseTSV(text) {
+    // Expect header: Name<TAB>SMILES (case-sensitive by default)
+    const lines = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n").filter(l => l.trim() !== "");
+    if (lines.length < 2) throw new Error("File looks empty or missing data rows.");
+
+    const header = lines[0].split("\t");
+    const nameIdx = header.indexOf("Name");
+    const smilesIdx = header.indexOf("SMILES");
+    if (nameIdx === -1 || smilesIdx === -1) {
+      throw new Error(`Header must contain 'Name' and 'SMILES' separated by tabs. Found: ${header.join(", ")}`);
+    }
+
+    const rows = [];
+    for (let i = 1; i < lines.length; i++) {
+      const cols = lines[i].split("\t");
+      const name = (cols[nameIdx] ?? "").trim();
+      const smiles = (cols[smilesIdx] ?? "").trim();
+      rows.push({ idx: i, name, smiles });
+    }
+    return rows;
+  }
+
+  async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  async function callApi(smiles, maxRetries) {
+    // Returns {sim, err}
+    if (!smiles) return { sim: "", err: "SMILES is empty" };
+
+    let attempt = 0;
+    while (true) {
+      try {
+        const res = await fetch(API, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ smiles })
+        });
+
+        if (res.ok) {
+          const data = await res.json();
+          return { sim: (data.similarity ?? ""), err: "" };
+        } else {
+          let detail = "";
+          try {
+            const j = await res.json();
+            detail = j.detail ?? JSON.stringify(j);
+          } catch {
+            detail = await res.text();
+          }
+          const msg = `${res.status}: ${detail}`.trim();
+
+          // Retry only on likely transient errors
+          const transient = (res.status === 429 || res.status === 500 || res.status === 502 || res.status === 503 || res.status === 504);
+          if (attempt < maxRetries && transient) {
+            attempt++;
+            await sleep(250 * attempt);
+            continue;
+          }
+          return { sim: "", err: msg };
+        }
+      } catch (e) {
+        const msg = (e && e.message) ? e.message : String(e);
+        if (attempt < maxRetries) {
+          attempt++;
+          await sleep(250 * attempt);
+          continue;
+        }
+        return { sim: "", err: msg };
+      }
+    }
+  }
+
+  function renderPreview(results) {
+    previewBody.innerHTML = "";
+    const preview = results.slice(0, 20);
+    for (const r of preview) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td>${r.n}</td>
+        <td>${r.name}</td>
+        <td class="mono">${r.smiles}</td>
+        <td class="${r.err ? "err" : "ok"}">${r.sim}</td>
+        <td class="err">${r.err}</td>
+      `;
+      previewBody.appendChild(tr);
+    }
+  }
+
+  function makeCsv(results) {
+    const header = ["Name", "SMILES", SIM_COL, "error"];
+    const lines = [header.map(escapeCsv).join(",")];
+    for (const r of results) {
+      lines.push([
+        escapeCsv(r.name),
+        escapeCsv(r.smiles),
+        escapeCsv(r.sim),
+        escapeCsv(r.err)
+      ].join(","));
+    }
+    return lines.join("\n");
+  }
+
+  function downloadText(filename, text) {
+    const blob = new Blob([text], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  fileEl.addEventListener("change", () => {
+    abort = false;
+    lastCsv = null;
+    prog.value = 0;
+    downloadBtn.disabled = true;
+    runBtn.disabled = !fileEl.files?.length;
+    setStatus(fileEl.files?.length ? "File loaded. Ready to run." : "Waiting for file…");
+  });
+
+  cancelBtn.addEventListener("click", () => {
+    abort = true;
+    cancelBtn.disabled = true;
+    setStatus("Cancel requested…");
+  });
+
+  downloadBtn.addEventListener("click", () => {
+    if (!lastCsv) return;
+    downloadText("tanimoto_results.csv", lastCsv);
+  });
+
+  runBtn.addEventListener("click", async () => {
+    abort = false;
+    lastCsv = null;
+    downloadBtn.disabled = true;
+
+    const file = fileEl.files?.[0];
+    if (!file) return;
+
+    runBtn.disabled = true;
+    cancelBtn.disabled = false;
+
+    try {
+      setStatus("Reading file…");
+      const text = await file.text();
+      const rows = parseTSV(text);
+      const total = rows.length;
+
+      const concurrency = parseInt(concurrencyEl.value, 10) || 3;
+      const maxRetries = parseInt(retriesEl.value, 10) || 0;
+
+      setStatus(`Processing ${total} molecules (concurrency=${concurrency})…`);
+      prog.max = total;
+      prog.value = 0;
+
+      const results = new Array(total);
+      let done = 0;
+      let nextIndex = 0;
+
+      const worker = async () => {
+        while (true) {
+          if (abort) return;
+
+          const my = nextIndex++;
+          if (my >= total) return;
+
+          const row = rows[my];
+          const { sim, err } = await callApi(row.smiles, maxRetries);
+
+          results[my] = { n: my + 1, name: row.name, smiles: row.smiles, sim, err };
+
+          done++;
+          prog.value = done;
+
+          if (done % 5 === 0 || done === total) {
+            const okCount = results.filter(x => x && !x.err).length;
+            const errCount = done - okCount;
+            setStatus(`Done ${done}/${total} | OK: ${okCount} | Errors: ${errCount}`);
+            renderPreview(results.filter(Boolean));
+          }
+
+          // Small pause to be polite (especially with higher concurrency)
+          await sleep(15);
+        }
+      };
+
+      // Start workers
+      const workers = Array.from({ length: concurrency }, () => worker());
+      await Promise.all(workers);
+
+      if (abort) {
+        setStatus(`Canceled. Completed ${done}/${total}. You can still download partial results.`);
+      } else {
+        setStatus(`Complete. Processed ${total} molecules.`);
+      }
+
+      // Fill any missing slots (shouldn’t happen but safe)
+      for (let i = 0; i < results.length; i++) {
+        if (!results[i]) {
+          results[i] = { n: i + 1, name: rows[i].name, smiles: rows[i].smiles, sim: "", err: "Not processed" };
+        }
+      }
+
+      lastCsv = makeCsv(results);
+      downloadBtn.disabled = false;
+      renderPreview(results);
+
+    } catch (e) {
+      setStatus(`Error: ${e.message || e}`);
+      console.error(e);
+    } finally {
+      runBtn.disabled = false;
+      cancelBtn.disabled = true;
+    }
+  });
+
+})();
+</script>
+</body>
+</html>
+
