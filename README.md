@@ -260,11 +260,4 @@ pmemd.cuda -O -i step5_production.mdin -o prod.out \
 
 ---
 
-## Suggested end-to-end order
-
-1. Prepare receptor + ligand `.sdf` files, run `Docking_vina.sh` → `results.csv` + docked poses in `Results/`.
-2. Select the docked pose(s) of interest and build a solvated, parameterized complex (`prmtop`/`inpcrd`) with `tleap` or CHARMM-GUI.
-3. Run the `MD_inputs/` protocol in order: `step4.0_minimization.mdin` → `step4.1_equilibration.mdin` → `step5_production.mdin`.
-
-(If your workflow is actually docking-after-MD, as the hardcoded path hints, swap the order and dock against a representative structure pulled from the production trajectory instead.)
 
